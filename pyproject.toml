@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "timsim v2 prediction CLI jobs (CCS, RT, MS2 fragment intensity) — parquet I/O over the pepdl predictors. The pipeline's prediction step, free of imspy dead weight."
 requires-python = ">=3.11"
 license = { text = "MIT" }
-dependencies = ["pepdl>=0.1.0", "numpy>=1.21", "pandas>=1.3", "pyarrow>=13"]
+dependencies = ["pepdl @ git+https://github.com/theGreatHerrLebert/pepdl.git", "numpy>=1.21", "pandas>=1.3", "pyarrow>=13"]
 
 [project.optional-dependencies]
 local = ["pepdl[local]"]
