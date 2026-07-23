@@ -19,5 +19,8 @@ timsim-ccs = "timsim_predict.ccs:main"
 timsim-rt = "timsim_predict.rt:main"
 timsim-fragments = "timsim_predict.fragments:main"
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/timsim_predict"]
