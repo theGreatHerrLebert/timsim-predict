@@ -16,8 +16,8 @@ so a "flatten then decode a slot" approach is a trap: pick the wrong pair and ev
 This module therefore does **not** flatten at all. It decodes the ``(29,2,3)`` tensor **directly**,
 which is unambiguous, and takes the one axis fact it needs — that axis-2 index 0 is a *y* ion and
 index 1 is a *b* ion — from ``flatten_prosit_array``'s own source (``array[:, 0, c]`` is y,
-``array[:, 1, c]`` is b), not from reasoning. ``test_fragment_decode.py`` pins that fact against that
-function, so an axis mistake fails a test rather than corrupting a benchmark.
+``array[:, 1, c]`` is b), not from reasoning. ``tests/test_fragment_decode.py`` pins that fact against
+that function, so an axis mistake fails a test rather than corrupting a benchmark.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 # Authoritative from flatten_prosit_array's source: axis-2 index 0 is a y ion, index 1 is a b ion.
-# Pinned by test_fragment_decode.py against that function.
+# Pinned by tests/test_fragment_decode.py against that function.
 _AXIS2_ION = {0: "y", 1: "b"}
 
 
@@ -281,7 +281,8 @@ def main(argv=None) -> int:
                          "render applies per-run CE calibration and down-sampling on top.")
     ap.add_argument("--floor", type=float, default=1e-3)
     ap.add_argument("--model", default=None,
-                    help="intensity model spec: omit for our default. See ...timsim.models.")
+                    help="intensity model spec: omit for our default, or 'koina:<name>' for a Koina "
+                         "model. See timsim_predict._models.")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args(argv)
 
