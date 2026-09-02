@@ -47,7 +47,16 @@ def resolve(property: str, spec: Optional[str]) -> Tuple[str, str]:
     """
     if property not in DEFAULTS:
         raise ValueError(f"unknown predicted property {property!r}; known: {sorted(DEFAULTS)}")
-    if spec is None or spec == "default":
+    # "" is the flow's historical spelling of "use the default" (timsim_flow.py passes
+    # --frag-model "" for the local timsTOF model). It previously fell through to the
+    # ("local", spec) branch below, which loads the SAME predictor but records an EMPTY provenance
+    # string: every timsTOF fragment_intensities artifact ever produced carries
+    # `timsim.fragments.model = ''`, so nothing in a rendered cohort says which model made it.
+    # Behaviour was never wrong; identity was unrecoverable.
+    #
+    # EXACTLY "" -- not whitespace. `"  "` stays an error: it is a typo, and silently turning a typo
+    # into a different model choice is the same class of bug as the empty provenance string.
+    if spec is None or spec == "default" or spec == "":
         return ("local", DEFAULTS[property])
     if spec.startswith(_KOINA_PREFIX):
         name = spec[len(_KOINA_PREFIX):].strip()
