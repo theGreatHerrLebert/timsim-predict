@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections import defaultdict
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -33,6 +34,7 @@ import re
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+from timsim_predict._models import provenance as _provenance
 import pyarrow.parquet as pq
 
 # Authoritative from flatten_prosit_array's source: axis-2 index 0 is a y ion, index 1 is a b ion.
@@ -120,6 +122,17 @@ def _predict_tensors_koina(sequences, charges, collision_energies, name: str):
     return pred
 
 
+@lru_cache(maxsize=1)
+def _local_predictor():
+    """The local intensity predictor, constructed ONCE.
+
+    Predicting in slices calls this per slice, and constructing the predictor loads model weights —
+    doing that per slice would trade the memory blow-up for a runtime one.
+    """
+    from pepdl.intensity.predictors import DeepPeptideIntensityPredictor
+    return DeepPeptideIntensityPredictor()
+
+
 def predict_tensors(sequences, charges, collision_energies, model: Optional[str] = None):
     """Predict per-precursor ``(29,2,3)`` intensity tensors with the resolved intensity model.
     Returns ``(array[n,29,2,3], provenance)``."""
@@ -129,9 +142,7 @@ def predict_tensors(sequences, charges, collision_energies, model: Optional[str]
     if kind == "koina":
         return _predict_tensors_koina(sequences, charges, collision_energies, name), f"koina:{name}"
 
-    from pepdl.intensity.predictors import DeepPeptideIntensityPredictor
-
-    predictor = DeepPeptideIntensityPredictor()
+    predictor = _local_predictor()
     pred = predictor.predict_intensities(
         sequences=list(sequences),
         charges=[int(c) for c in charges],
@@ -211,6 +222,7 @@ def predict_fragment_batches(
     floor: float = 1e-3,
     model: Optional[str] = None,
     chunk: int = 2_000_000,
+    predict_chunk: int = 200_000,
     verbose: bool = True,
     ce_source: Optional[str] = None,
     ce_tolerance: float = 1e-6,
@@ -224,6 +236,11 @@ def predict_fragment_batches(
     frame, which at scale cost ~17 GB (and a slow per-row ``.iloc`` loop). Rows above ``floor``;
     structurally-absent slots (Prosit marks them -1) are dropped.
     """
+    if predict_chunk <= 0:
+        # A negative step makes range() yield nothing, so the function would return an EMPTY
+        # fragment library and exit 0 -- a wrong answer that looks like a right one.
+        raise ValueError(f"predict_chunk must be positive, got {predict_chunk}")
+
     need = {"precursor_id", "sequence", "charge"}
     missing = need - set(precursors.columns)
     if missing:
@@ -251,17 +268,18 @@ def predict_fragment_batches(
             print(f"    collision energy  : per-precursor ({ce_source or 'supplied'}) — "
                   f"{per_key_ce.min():.3f}-{per_key_ce.max():.3f} eV over the keys, "
                   f"worst within-key spread {worst_spread:g} eV")
-        tensors, prov = predict_tensors(
-            keys["sequence"], keys["charge"], per_key_ce, model=model
-        )
-        schema = fragment_schema(prov, collision_energy, ce_source=ce_source or "per-precursor")
+        key_ce = np.asarray(per_key_ce, dtype=float)
+        schema_ce_source = ce_source or "per-precursor"
     else:
         if verbose:
             print(f"    collision energy  : {collision_energy}")
-        tensors, prov = predict_tensors(
-            keys["sequence"], keys["charge"], [collision_energy] * len(keys), model=model
-        )
-        schema = fragment_schema(prov, collision_energy)
+        key_ce = np.full(len(keys), float(collision_energy))
+        schema_ce_source = None
+
+    # Provenance WITHOUT calling the model, so the schema exists before the first slice is predicted.
+    prov = _provenance("fragments", model)
+    schema = (fragment_schema(prov, collision_energy, ce_source=schema_ce_source)
+              if schema_ce_source else fragment_schema(prov, collision_energy))
 
     # key -> the precursor_ids sharing it, built with numpy .values (no pandas scalar indexing in the
     # hot path — that indexing, not the model, was the bulk of the old runtime).
@@ -275,19 +293,41 @@ def predict_fragment_batches(
     def batches():
         bp, bi, bo, bf, bv = [], [], [], [], []
         total = 0
-        for i, key in enumerate(key_tuples):
-            frags = list(decode_tensor(tensors[i], floor))  # decode this key once
-            if not frags:
-                continue
-            for pid in key2pids.get(key, ()):
-                for it, ordinal, fc, v in frags:
-                    bp.append(pid); bi.append(it); bo.append(ordinal); bf.append(fc); bv.append(v)
-            if len(bp) >= chunk:
-                yield pa.record_batch(
-                    [pa.array(bp, pa.uint64()), pa.array(bi, pa.string()), pa.array(bo, pa.uint16()),
-                     pa.array(bf, pa.uint8()), pa.array(bv, pa.float32())], schema=schema)
-                total += len(bp)
-                bp, bi, bo, bf, bv = [], [], [], [], []
+        # Predict in SLICES of keys. Predicting every key up front materialised an
+        # (n_keys, 29, 2, 3) float32 tensor before a single batch was emitted -- 6.3 GB at 9.0M
+        # keys -- and on the Koina path a second full copy in long format on top, which OOM-killed a
+        # full human digest at 85% on a 31 GB box. The OUTPUT was already streamed; the INPUT was
+        # not.
+        #
+        # This removes the DOMINANT term; it does not make the whole function slice-bounded.
+        # `precursors`, `keys`, `key_ce`, `key_tuples` and above all `key2pids` (a dict holding a
+        # Python list of ids for EVERY precursor) stay whole-dataset, and one very high-fanout key
+        # can push the accumulators past `chunk`, since a flush only happens between keys.
+        for start in range(0, len(key_tuples), predict_chunk):
+            stop = min(start + predict_chunk, len(key_tuples))
+            tensors, got_prov = predict_tensors(
+                keys["sequence"].values[start:stop], keys["charge"].values[start:stop],
+                key_ce[start:stop], model=model)
+            if got_prov != prov:
+                # The schema is already written with `prov`; a mismatch would mislabel every
+                # artifact produced from here on.
+                raise RuntimeError(
+                    f"model provenance changed mid-prediction: schema says {prov!r}, "
+                    f"slice starting at {start} reports {got_prov!r}")
+            for i, key in enumerate(key_tuples[start:stop]):
+                frags = list(decode_tensor(tensors[i], floor))  # decode this key once
+                if not frags:
+                    continue
+                for pid in key2pids.get(key, ()):
+                    for it, ordinal, fc, v in frags:
+                        bp.append(pid); bi.append(it); bo.append(ordinal); bf.append(fc); bv.append(v)
+                if len(bp) >= chunk:
+                    yield pa.record_batch(
+                        [pa.array(bp, pa.uint64()), pa.array(bi, pa.string()), pa.array(bo, pa.uint16()),
+                         pa.array(bf, pa.uint8()), pa.array(bv, pa.float32())], schema=schema)
+                    total += len(bp)
+                    bp, bi, bo, bf, bv = [], [], [], [], []
+            del tensors      # drop the slice before the next one is predicted, not within it
         if bp:
             yield pa.record_batch(
                 [pa.array(bp, pa.uint64()), pa.array(bi, pa.string()), pa.array(bo, pa.uint16()),
@@ -348,6 +388,12 @@ def main(argv=None) -> int:
                          "predictor can honour exactly one CE per key, so a spread above this would be "
                          "silently discarded.")
     ap.add_argument("--floor", type=float, default=1e-3)
+    ap.add_argument("--predict-chunk", type=int, default=200_000,
+                    help="distinct (sequence, charge) keys sent to the model per call (default "
+                         "200000). The predictor runs in slices so peak memory is one slice rather "
+                         "than the whole digest: predicting 9.0M keys at once needs a 6.3 GB tensor "
+                         "before any output row is written, and on the Koina path a second full copy "
+                         "in long format, which OOM-kills a full human digest on a 31 GB box.")
     ap.add_argument("--model", default=None,
                     help="intensity model spec: omit for our default, or 'koina:<name>' for a Koina "
                          "model. See timsim_predict._models.")
@@ -403,13 +449,26 @@ def main(argv=None) -> int:
     _prov, schema, batches = predict_fragment_batches(
         prec, a.collision_energy, floor=a.floor, model=a.model, verbose=not a.quiet,
         ce_source=ce_source, ce_tolerance=a.ce_tolerance,
+        predict_chunk=a.predict_chunk,
     )
-    writer = pq.ParquetWriter(a.out, schema)
+    # Write to a temp file and rename only on success. Prediction now happens WHILE the generator is
+    # consumed, not before it is returned, so a model or network failure lands mid-write -- and the
+    # writer's close() would leave a structurally valid Parquet file holding a PREFIX of the library.
+    # A downstream step cannot tell that from a complete one. The rename is atomic within a
+    # directory, so the output path only ever exists finished.
+    tmp = a.out.with_name(a.out.name + ".partial")
+    writer = pq.ParquetWriter(tmp, schema)
     try:
         for batch in batches:
             writer.write_table(pa.Table.from_batches([batch], schema=schema))
-    finally:
         writer.close()
+    except BaseException:
+        try:
+            writer.close()
+        finally:
+            tmp.unlink(missing_ok=True)
+        raise
+    tmp.replace(a.out)
     if not a.quiet:
         print(f"  -> {a.out}")
     return 0
